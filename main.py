@@ -33,9 +33,18 @@ from pydantic import BaseModel
 import chromadb
 from google import genai
 from google.genai import types as genai_types
+from google.genai import errors as genai_errors
 
 # ---- Config ----
-GEMINI_MODEL = "gemini-2.5-flash"          # main reasoning model
+# Fallback chain: tried in order for every Gemma/Gemini call. Gemma models
+# are tried FIRST since this is a "Build with Gemma" hackathon submission --
+# Gemini models are only a backup if Gemma is unavailable/rate-limited.
+MODEL_CHAIN = [
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+]
 EMBEDDING_MODEL = "gemini-embedding-001"   # must match embed_and_upsert.py
 CHROMA_COLLECTION = "disease_kb"           # must match embed_and_upsert.py
 TOP_K = 1  # only need the single best match for this use case
@@ -99,6 +108,32 @@ class DiagnoseResponse(BaseModel):
     transcribed_input: str
 
 
+def generate_with_fallback(client: genai.Client, contents, system_instruction: str):
+    """
+    Tries each model in MODEL_CHAIN in order until one succeeds. Raises the
+    last error if every model fails, so the caller can return a clean 503
+    instead of the request crashing with an unhandled 500.
+    """
+    last_error: Optional[Exception] = None
+    for model in MODEL_CHAIN:
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(system_instruction=system_instruction),
+            )
+        except genai_errors.ClientError as e:
+            last_error = e
+            continue  # quota/rate/not-found on this model -- try the next one
+        except Exception as e:
+            last_error = e
+            continue
+    raise HTTPException(
+        status_code=503,
+        detail="All AI models are currently unavailable (rate limits or outages). Please try again shortly."
+    ) from last_error
+
+
 # ---- Step 1: transcribe/understand the raw input via Gemma ----
 
 def extract_symptoms(req: DiagnoseRequest) -> tuple[str, str]:
@@ -132,11 +167,7 @@ def extract_symptoms(req: DiagnoseRequest) -> tuple[str, str]:
     else:
         raise HTTPException(status_code=400, detail="Missing input data for the given input_type")
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=parts,
-        config=genai_types.GenerateContentConfig(system_instruction=system_instruction),
-    )
+    response = generate_with_fallback(client, parts, system_instruction)
 
     text = response.text.strip()
     if text.startswith("```"):
@@ -220,11 +251,7 @@ def generate_guidance(metadata: dict, symptom_description: str, language_hint: s
         "Write a short, clear message combining this into actionable advice for the user."
     )
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(system_instruction=system_instruction),
-    )
+    response = generate_with_fallback(client, prompt, system_instruction)
 
     text = response.text.strip()
     if text.startswith("```"):
@@ -280,3 +307,57 @@ def diagnose(req: DiagnoseRequest):
 def health():
     """Cheap endpoint to keep Render's free tier warm via an external pinger."""
     return {"status": "ok"}
+
+
+# ---- Chat endpoint (free-form conversation, separate from /diagnose) ----
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]  # full conversation history, oldest first
+    domain: Optional[Literal["crop", "animal", "human"]] = None  # optional context hint
+    source: Literal["app", "telegram"] = "app"
+
+
+class ChatResponse(BaseModel):
+    reply: str
+
+
+CHAT_SYSTEM_INSTRUCTION = (
+    "You are a friendly, knowledgeable assistant helping people in Nigeria with "
+    "general questions about crop health, animal health, and human health. "
+    "This is an open conversation, not a formal diagnosis -- if someone describes "
+    "specific symptoms and wants an actual diagnosis, gently suggest they use the "
+    "app's dedicated Diagnosis feature instead, since that one is grounded in a "
+    "verified knowledge base. For general questions, explanations, or casual "
+    "conversation, answer helpfully and warmly in plain, simple language. Keep "
+    "responses reasonably short and conversational. If a question touches on "
+    "human health, remind the user (briefly, not repetitively) to see a real "
+    "doctor for anything serious."
+)
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+    client = get_gemini_client()
+
+    # Convert the conversation history into the format generate_content expects:
+    # a list of Content parts alternating user/model turns.
+    contents = []
+    for msg in req.messages:
+        role = "model" if msg.role == "assistant" else "user"
+        contents.append(genai_types.Content(role=role, parts=[genai_types.Part(text=msg.content)]))
+
+    system_instruction = CHAT_SYSTEM_INSTRUCTION
+    if req.domain:
+        system_instruction += f" The user has been browsing the '{req.domain}' section of the app."
+
+    response = generate_with_fallback(client, contents, system_instruction)
+
+    return ChatResponse(reply=response.text.strip())
